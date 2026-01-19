@@ -1,0 +1,10 @@
+langchain
+langchain-core
+langchain-community
+langgraph
+openai
+langchain-openai
+typing_extensions
+python-dotenv
+langchain-text-splitters
+streamlit
