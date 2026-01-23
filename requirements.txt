@@ -8,3 +8,4 @@ typing_extensions
 python-dotenv
 langchain-text-splitters
 streamlit
+torch

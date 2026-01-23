@@ -1,12 +1,12 @@
-from dataclasses import dataclass
+# from dataclasses import dataclass
 
-@dataclass
-class Citation:
-    source: str
-    competition: str | None
-    year: int | None
-    section: str | None
-    confidence: str
+# @dataclass
+# class Citation:
+#     source: str
+#     competition: str | None
+#     year: int | None
+#     section: str | None
+#     confidence: str
 
 def extract_confidence(text: str) -> str:
     t = text.lower()

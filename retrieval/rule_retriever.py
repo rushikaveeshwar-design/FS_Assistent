@@ -1,6 +1,10 @@
 def retrieve_rules(store, query: str, 
                    competition: str, year: int, 
-                   k: int=5):
+                   domain: str | None=None, k: int=5):
+    filters = {"competition": competition,
+               "year": year}
+    if domain:
+        filters["domain"] = domain
+
     return store.similarity_search(query, k=k,
-                                   filter={"competition": competition,
-                                           "year": year}) # Rule must be filtered before being trusted
+                                   filter=filters) # Rule must be filtered before being trusted
