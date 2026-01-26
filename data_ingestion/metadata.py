@@ -18,6 +18,7 @@ class EnggMetadata:
 @dataclass
 class ImageMetadata:
     source: str
+    page: int
     domain: str
     competition: str
     year: int

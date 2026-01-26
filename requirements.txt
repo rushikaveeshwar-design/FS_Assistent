@@ -9,3 +9,6 @@ python-dotenv
 langchain-text-splitters
 streamlit
 torch
+torchvision
+openai-clip
+PyMuPDF

@@ -1,5 +1,7 @@
 import os
 from retrieval.vectorstore import VectorStoreManager
+from data_ingestion.clip_embedder import embed_images
+# from data_ingestion.metadata import ImageMetadata
 
 RULE_STORE_PATH = "vectorstores/rules_text"
 ENGG_STORE_PATH = "vectorstores/engg_text"
@@ -21,9 +23,15 @@ def build_engg_store(chunks, metadatas, embedding_model):
     manager.save_store(store, ENGG_STORE_PATH)
 
 
-def build_image_store(image_embeddings, metadatas, embedding_model):
+def build_image_store(images, metadatas, 
+                      clip_model, preprocess, 
+                      device, embedding_model):
     os.makedirs(IMAGE_STORE_PATH, exist_ok=True)
 
+    embeddings = embed_images(images, clip_model, 
+                              preprocess, device)
+
     manager = VectorStoreManager(embedding_model)
-    store = manager.create_store_from_images(image_embeddings, metadatas)
+    store = manager.create_store_from_images(image_embedding=embeddings, 
+                                             metadatas=metadatas)
     manager.save_store(store, IMAGE_STORE_PATH)

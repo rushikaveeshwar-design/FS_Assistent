@@ -2,12 +2,15 @@ from retrieval.rule_retriever import retrieve_rules
 from retrieval.engg_retriever import retrieve_engg
 from typing import Generator, Dict
 from agent.main import build_gragh
-from retrieval.vectorstore import load_rule_store, load_engg_store
+from retrieval.vectorstore import (load_rule_store, 
+                                   load_engg_store, 
+                                   load_image_store)
 
 class AgentTool:
-    def __init__(self, rule_store, engg_store):
+    def __init__(self, rule_store, engg_store, image_store):
         self.rule_store = rule_store
         self.engg_store = engg_store
+        self.image_store = image_store
 
     def get_rules(self, query, competition, year, domain=None):
         return retrieve_rules(store=self.rule_store,
@@ -16,12 +19,18 @@ class AgentTool:
     
     def get_engg(self, query):
         return retrieve_engg(store=self.engg_store, query=query)
+    
+    def get_image_by_vector(self, query_vector, k=1):
+        if not self.image_store:
+            return []
+        return self.image_store.similarity_search_by_vector(query_vector, k=k)
 
-def compile_graph(llm):
-    rule_store = load_rule_store()
-    engg_store = load_engg_store()
+def compile_graph(llm, embedding_model, clip_embedding_model):
+    rule_store = load_rule_store(embedding_model)
+    engg_store = load_engg_store(embedding_model)
+    image_store = load_image_store(clip_embedding_model)
 
-    tools = AgentTool(rule_store, engg_store)
+    tools = AgentTool(rule_store, engg_store, image_store)
     return build_gragh(llm, tools)
     
 

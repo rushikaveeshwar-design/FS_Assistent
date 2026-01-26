@@ -25,6 +25,21 @@ if "year" not in st.session_state:
 if "subsystem" not in st.session_state:
     st.session_state.subsystem = None
 
+if "inspection_active" not in st.session_state:
+    st.session_state.inspection_active = False
+
+if "inspection_state" not in st.session_state:
+    st.session_state.inspection_state = {
+        "inspection_stage": 0,
+        "inspection_strictness": 0,
+        "inspection_status": None,
+        "inspection_history": [],
+        "last_user_answer": None
+    }
+
+if "last_inspection_question" not in st.session_state:
+    st.session_state.last_inspection_question = None
+
 # Sidebar control panel
 # st.sidebar.title("Formula Student Assistant")
 if st.sidebar.button("New Chat"):
@@ -65,6 +80,10 @@ else:
     user_input = st.text_input("Ask your question",
                                placeholder="Ask anything within the event space")
 
+if st.session_state.mode == "Tech Inspection" and st.session_state.inspection_active:
+    st.markdown("### Current Inspection Question")
+    st.markdown(st.session_state.last_inspection_question)
+
 submit = st.button("Submit")
 
 # Agent invocation (Streaming)
@@ -78,8 +97,69 @@ def stream_answer(generator):
 
     return accumulated
 
+def run_inspection_step(question, last_user_answer=None):
+    final_payload = {}
+
+    def agent_stream():
+        for event in run_agent_stream(question=question,
+                                      mode="Tech Inspection",
+                                      competition=st.session_state.competition,
+                                      year=st.session_state.year,
+                                      chat_id=st.session_state.chat_id,
+                                      **st.session_state.inspection_state,
+                                      last_user_answer=last_user_answer):
+            if "token" in event:
+                yield event["token"]
+
+            if "answer" in event:
+                final_payload.upadate(event)
+        
+    answer_text = stream_answer(agent_stream())
+    return answer_text, final_payload
 
 if submit and user_input.strip():
+
+    if st.session_state.mode == "Tech Inspection":
+        if not st.session_state.inspection_active:
+            st.session_state.inspection_active = True
+
+            question, payload = run_inspection_step(question=user_input)
+            st.session_state.last_inspection_question = question
+            st.session_state.inspection_state["inspection_history"].append({"question": question})
+
+            st.stop()
+    
+        else:
+            user_answer = user_input
+            st.session_state.inspection_state["last_user_answer"] = user_answer
+
+            question, payload = run_inspection_step(question=st.session_state.last_inspection_question,
+                                                    last_user_answer=user_answer)
+            
+            status = st.session_state.inspection_state.get("inspection_status")
+
+            if status in ("PASS", "FAIL"):
+                st.markdown(f"### Inspection Result: {status}")
+                st.markdown(payload["answer"])
+            
+            # reset inspection state
+                st.session_state.inspection_active = False
+                st.session_state.last_inspection_question = None
+                st.session_state.inspection_state = {
+                    "inspection_stage": 0,
+                    "inspection_strictness": 0,
+                    "inspection_status": None,
+                    "inspection_history": [],
+                    "last_user_answer": None
+                }
+                st.stop()
+            
+            # continue inspection
+            st.session_state.last_inspection_question = question
+            st.session_state.inspection_state["inspection_history"].append({"question": question,
+                                                                            "user_answer": user_answer})
+            st.stop()
+
     # Storing user message
     chat_store.add_message(
         st.session_state.chat_id,
@@ -112,3 +192,9 @@ if submit and user_input.strip():
             "assumptions": final_payload.get("assumptions", []),
             "citations": final_payload.get("citations", []),
         }
+
+        if response.get("images"):
+            with st.expander("Relevant diagrams and figures"):
+                for img in response["images"]:
+                    st.markdown(f"- **{img["source"]}**, page {img["page"]}"
+                                f"({img.get("caption, diagram")})")

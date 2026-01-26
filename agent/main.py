@@ -4,6 +4,7 @@ from langgraph.graph import StateGraph
 from citations import analyze_rule_docs
 from models import AnalyzedRule, CitationModel, AnswerPayload
 from agent.subsystem import infer_subsystem
+from retrieval.image_retriever import retrieve_relevant_images, retrieving_images
 
 class ChatState(BaseModel):
     question: str
@@ -14,6 +15,14 @@ class ChatState(BaseModel):
     retrieved_engg: List[str]
     intent: Optional[str]
     answer: Optional[dict] = None
+    design_claims: List[str] = []
+    audit_results: Optional[List[dict]] = None
+    inspection_history: List[dict] = []
+    inspection_stage: int = 0
+    inspection_status: str = None
+    inspection_strictness: int = 0
+    inspection_focus: str = None
+    last_user_answer: Optional[str] = None
 
 system_prompt = """
 You are a formula student engineering assistant.
@@ -90,27 +99,88 @@ def compare_rules_node(state, tools):
     state["comparison"] = all_results
     return state
 
+def evaluate_inspection_response(answer: str, strictness: int):
+    """ Returns: 'pass', 'ambiguous', 'fail' """
+    a = answer.lower()
+
+    if any(key in a for key in ["not sure", "maybe", "depends"]):
+        return "fail" if strictness >= 3 else "ambiguous"
+    
+    if any(key in a for key in ["violates", "not allowed", "non compliant"]):
+        return "fail"
+    
+    if any(key in a for key in ["meets", "complies", "as per the rule"]):
+        return "pass"
+    
+    return "ambiguous"
+
 def inspector_node(state, llm):
-    prompt = """
+    prompt = f"""
 You are a Formula Student technical inspector.
 
-Ask one precise, rule-backed question
+Inspection stage: {state.inspection_stage}
+Strictness level: {state.inspection_strictness}
+Focus area: {state.inspection_focus}
+
+Previous interactions:
+{state.inspection_history}
+
+Instructions:
+- Ask one precise and most critical, rule-backed inspection question
 based on the current discussion.
-Do not explain unless asked.
+- Increase strictness if ambiguity was observed.
+- Do not explain unless asked.
 """
     
     question = llm.invoke(prompt)
-    state["inspector_question"] = question
+    state.inspection_history.append({"stage": state.inspection_stage,
+                                     "question": question})
+    state.inspection_stage += 1
+
+    state.answer = {"answer": question,
+                    "assumptions": [],
+                    "citations": []}
+    return state
+
+def inspection_evaluation_node(state: ChatState):
+    last_user_answer = state.last_user_answer
+
+    verdict = evaluate_inspection_response(last_user_answer,
+                                           state.inspection_strictness)
+    if verdict == "fail":
+        state.inspection_status = "FAIL"
+        state.answer = {"answer": "Inspection failed due to rule non-compliance.",
+                        "assumptions": [],
+                        "citations": []}
+        return state
+
+    if verdict == "pass":
+        if state.inspection_strictness >= 3:
+            state.inspection_status = "PASS"
+            state.answer = {"answer": "Inspection passed. No blocking issues identified.",
+                        "assumptions": [],
+                        "citations": []}
+            return state
+        state.inspection_strictness += 1
+
+    state.inspection_strictness += 1
     return state
 
 def compress_rules(rules: list[AnalyzedRule], max_rules=4):
     priority = {"must": 0, "should": 1, "may": 2, "unspecified": 3}
     return sorted(rules, key=lambda r: priority[r.confidence])[:max_rules]
 
-def synthesize_answer(state: ChatState, llm):
+def synthesize_answer(state: ChatState, llm, tools, 
+                      clip_model, device):
         
     assumptions = infer_assumptions(state)
     rules = compress_rules(state.retrieved_rules)
+
+    images = []
+    if retrieving_images(state.question):
+        images = retrieve_relevant_images(query=state["question"],
+                                        tools=tools, clip_model=clip_model,
+                                        device=device, k=1)
 
     prompt = f"""
 
@@ -125,10 +195,15 @@ Rules:
 Engineering:
 {state.retrieved_engineering}
 
+Available diagrams:
+{images}
+
 Instructions:
 - Clearly distinguish rule requirements from engineering advice
 - Do not infer legality beyond provided rules
-- explicitly state assumptions
+- Explicitly state assumptions
+- Use diagrams only as supporting reference
+- Do not invent diagram details
 
 Provide a clear, grounded answer:
 """
@@ -154,9 +229,10 @@ Provide a clear, grounded answer:
         answer=answer_text,
         citations=citations,
         assumptions=assumptions,
+        images=images
     )
 
-    state.answer = payload.dict()
+    state.answer = payload
     return state, {"final_answer": payload}
 
 def synthesize_audit(claims, matched_rules, llm):
@@ -201,13 +277,43 @@ def audit_claim(claim: str, rules):
             findings.append(rule)
     return findings
 
+def extract_claims_node(state: ChatState):
+    state.design_claims = extract_design_claims(state["question"])
+    return state
+
+def audit_node(state: ChatState):
+    results = []
+
+    for claim in state.design_claims:
+        matched = audit_claim(claim, state.retrieved_rules)
+        results.append({"claim":claim,
+                        "matched_rules": matched})
+    state.audit_results = results
+    return state
+
+def synthesize_audit_node(state: ChatState, llm):
+    report = synthesize_audit(claims=state.design_claims,
+                              matched_rules=state.audit_results,
+                              llm=llm)
+    state.answer = {"answer": report, 
+                    "assumptions": infer_assumptions(state),
+                    "citations": []}
+    return state 
+
 def build_gragh(llm, tools):
     graph = StateGraph(ChatState)
 
     graph.add_node("classify", classify_intent)
     graph.add_node("get_rules", lambda s: retrieve_engg_node(s, tools))
-    graph.add_node("get_engineering", lambda s: retrieve_rule_node(s, tools))
+    graph.add_node("get_engg", lambda s: retrieve_rule_node(s, tools))
     graph.add_node("answer", lambda s: synthesize_answer(s, llm))
+
+    graph.add_node("extract_claims", extract_claims_node)
+    graph.add_node("audit", audit_node)
+    graph.add_node("audit_synthesis", lambda s: synthesize_audit_node(s, llm))
+
+    graph.add_node("compare", lambda s: compare_rules_node(s, tools))
+
     graph.add_node("inspect", lambda s: inspector_node(s, llm))
 
     graph.set_entry_point("classify")
@@ -216,13 +322,24 @@ def build_gragh(llm, tools):
                                 {"rule": "get_rules",
                                  "engineering": "get_engg",
                                  "hybrid": "get_rules",
-                                 "design_audit": "audit",
-                                 "compare": "compare_rulebook",
+                                 "design_audit": "extract_claims",
+                                 "comparison": "compare_rulebooks",
                                  "tech_inspection": "inspect"})
     
+    # Standard Q&A edges
     graph.add_edge("get_rules", "get_engg")
     graph.add_edge("get_engg", "answer")
 
+    # Design audit edges
+    graph.add_edge("extract_claims", "get_rules")
+    graph.add_edge("get_rules", "audit")
+    graph.add_edge("audit", "audit_synthesis")
+
+    # Comparison edge
+    graph.add_edge("compare", "answer")
+
     graph.set_finish_point("answer")
+    graph.set_finish_point("audit_synthesis")
+
     return graph.compile()
     

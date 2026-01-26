@@ -22,4 +22,6 @@ class ChatStore:
                           (chat_id, role, content, datetime.now(datetime.timezone.utc).isoformat()))
         
         self.conn.commit()
-        
+
+def generate_chat_title(question: str, mode: str):
+    return f"{mode}: {question[:40]}"

@@ -28,13 +28,24 @@ class CitationModel(BaseModel):
     source: str
     confidence: RuleConfidence
 
+class ImageReference(BaseModel):
+    source: str
+    page: int
+    domain: str
+    competition: Optional[str]
+    year: int
+    section: str
+    caption: Optional[str]
+
 class AnswerPayload(BaseModel):
     answer: str
     citation: List[CitationModel]
     assumptions: List[str]=Field(default_factory=list)
+    images: List[dict[ImageReference]]
 
 class AuditFinding(BaseModel):
     claim: str
     status: Literal["COMPLIANT", "AMBIGUOUS", "LIKELY NON-COMPLIANT"]
     explanation: str
     citations:List[CitationModel]
+    
