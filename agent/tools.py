@@ -40,8 +40,8 @@ def run_agent_stream(*, question: str, mode: str,
     """Yields incremental agent output.
     
     Final yield MUST contain:
-    {"answer": str, "assumption": list[str],
-    "citations": list[dict]}
+    {"answer": str, "assumptions": list[str],
+    "citations": list[dict], "images": list[dict] | None}
 
     """
 
@@ -59,4 +59,9 @@ def run_agent_stream(*, question: str, mode: str,
             yield {"token": update["answer_token"]}
 
         if "final_answer" in update:
-            yield update["final_answer"]
+            final_payload = update["final_answer"]
+
+            if "images" not in final_payload:
+                final_payload["images"] = []
+
+            yield final_payload

@@ -40,6 +40,9 @@ if "inspection_state" not in st.session_state:
 if "last_inspection_question" not in st.session_state:
     st.session_state.last_inspection_question = None
 
+if "last_inspection_images" not in st.session_state:
+    st.session_state.last_inspection_images = []
+
 # Sidebar control panel
 # st.sidebar.title("Formula Student Assistant")
 if st.sidebar.button("New Chat"):
@@ -84,6 +87,14 @@ if st.session_state.mode == "Tech Inspection" and st.session_state.inspection_ac
     st.markdown("### Current Inspection Question")
     st.markdown(st.session_state.last_inspection_question)
 
+if (st.session_state.mode == "Tech Inspection"
+    and st.session_state.inspection_active
+    and st.session_state.get("last_inspection_images")):
+    with st.expander(" Referenced Diagram"):
+        for img in st.session_state.last_inspection_images:
+            st.markdown(f"- **{img["source"]}**, page {img["page"]}")
+
+
 submit = st.button("Submit")
 
 # Agent invocation (Streaming)
@@ -112,7 +123,7 @@ def run_inspection_step(question, last_user_answer=None):
                 yield event["token"]
 
             if "answer" in event:
-                final_payload.upadate(event)
+                final_payload.update(event)
         
     answer_text = stream_answer(agent_stream())
     return answer_text, final_payload
@@ -125,6 +136,7 @@ if submit and user_input.strip():
 
             question, payload = run_inspection_step(question=user_input)
             st.session_state.last_inspection_question = question
+            st.session_state.last_inspection_images = payload.get("images", [])
             st.session_state.inspection_state["inspection_history"].append({"question": question})
 
             st.stop()
@@ -135,6 +147,10 @@ if submit and user_input.strip():
 
             question, payload = run_inspection_step(question=st.session_state.last_inspection_question,
                                                     last_user_answer=user_answer)
+            st.session_state.last_inspection_question = question
+            st.session_state.last_inspection_images = payload.get("images", [])
+            if "inspection_status" in payload:
+                st.session_state.inspection_state["inspection_status"] = payload["inspection_status"]
             
             status = st.session_state.inspection_state.get("inspection_status")
 
@@ -152,6 +168,7 @@ if submit and user_input.strip():
                     "inspection_history": [],
                     "last_user_answer": None
                 }
+                st.session_state.last_inspection_images = []
                 st.stop()
             
             # continue inspection
@@ -192,6 +209,19 @@ if submit and user_input.strip():
             "assumptions": final_payload.get("assumptions", []),
             "citations": final_payload.get("citations", []),
         }
+
+        if st.session_state.mode == "Design Audit" and "audit" in final_payload:
+            st.markdown("### Design Audit Results")
+
+            for item in final_payload["audit"]:
+                st.markdown(f"**Claim:** {item["claim"]}")
+                st.markdown(f"**Status:** {item["status"]}")
+                st.markdown(f"**Reason:** {item["reason"]}")
+
+                if item.get("citations"):
+                    with st.expander("Rule References"):
+                        for citation in item["citations"]:
+                            st.markdown(f"- Section {citation["section"]} ({citation["confidence"]})")
 
         if response.get("images"):
             with st.expander("Relevant diagrams and figures"):
