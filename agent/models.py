@@ -1,4 +1,4 @@
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Any
 from pydantic import BaseModel, Field
 
 RuleConfidence = Literal["must", "should", "may", "unspecified"]
@@ -41,7 +41,7 @@ class AnswerPayload(BaseModel):
     answer: str
     citation: List[CitationModel]
     assumptions: List[str]=Field(default_factory=list)
-    images: List[dict[ImageReference]]
+    images: List[dict[ImageReference, Any]]
 
 class AuditFinding(BaseModel):
     claim: str

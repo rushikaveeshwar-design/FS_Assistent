@@ -2,8 +2,8 @@ import re
 from typing import Optional, List
 from pydantic import BaseModel
 from langgraph.graph import StateGraph
-from citations import analyze_rule_docs
-from models import AnalyzedRule, CitationModel, AnswerPayload
+from agent.citations import analyze_rule_docs
+from agent.models import AnalyzedRule, CitationModel, AnswerPayload
 from agent.subsystem import infer_subsystem_from_context
 from retrieval.image_retriever import retrieve_relevant_images, retrieving_images
 

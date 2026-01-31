@@ -1,9 +1,10 @@
 from langchain_community.vectorstores import FAISS
 from langchain.embeddings import Embeddings
 from typing_extensions import List
-from data_ingestion.build_vectorstore import (RULE_STORE_PATH, 
-                                              ENGG_STORE_PATH, 
-                                              IMAGE_STORE_PATH)
+
+RULE_STORE_PATH = "vectorstores/rules_text"
+ENGG_STORE_PATH = "vectorstores/engg_text"
+IMAGE_STORE_PATH = "vectorstores/images"
 
 class VectorStoreManager:
     def __init__(self, embedding_model: Embeddings):
