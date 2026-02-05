@@ -5,6 +5,7 @@ class ChatStore:
     def __init__(self, db_path="chats.db"):
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self._create_tables()
+        self.init_document_tables()
 
     def _create_tables(self):
         self.conn.execute("""CREATE TABLE IF NOT EXISTS chats(
@@ -59,6 +60,27 @@ class ChatStore:
                                    AND content LIKE ?
                                    ORDER BY id ASC""",(chat_id, f"%{query}%"))
         return [{"role":role, "content": content} for role, content in cursor.fetchall()]
+    
+    def init_document_tables(self):
+        self.conn.execute("""CREATE TABLE IF NOT EXISTS documents 
+                          (document_id TEXT PRIMARY KEY,
+                          doc_type TEXT, vectorstore_path TEXT,
+                          created_at TEXT)""")
+        self.conn.execute("""CREATE TABLE IF NOT EXISTS chat_documents
+                          (chat_id TEXT, document_id TEXT,
+                          PRIMARY KEY (chat_id, document_id))""")
+        self.conn.commit()
+    
+    def attach_document_to_chat(self, chat_id: str, document_id: str, conn):
+        conn.execute("""
+                    INSERT OR IGNORE INTO chat_documents (chat_id, document_id)
+                    VALUES (?, ?)""", (chat_id, document_id))
+        conn.commit()
+
+    def document_exists(self, document_id: str):
+        cursor = self.conn.execute("SELECT 1 FROM documents WHERE document_id = ?",
+                                   (document_id,))
+        return cursor.fetchone() is not None
 
 def generate_chat_title(question: str, mode: str):
     return f"{mode}: {question[:40]}"

@@ -2,15 +2,15 @@ from retrieval.rule_retriever import retrieve_rules
 from retrieval.engg_retriever import retrieve_engg
 from typing import Generator, Dict
 from agent.main import build_gragh
-from retrieval.vectorstore import (load_rule_store, 
-                                   load_engg_store, 
-                                   load_image_store)
 
 class AgentTool:
-    def __init__(self, rule_store, engg_store, image_store):
+    def __init__(self, rule_store, engg_store, image_store,
+                 vectorstore_manager, chat_store):
         self.rule_store = rule_store
         self.engg_store = engg_store
         self.image_store = image_store
+        self.vectorstore_manager = vectorstore_manager
+        self.chat_store = chat_store
 
     def get_rules(self, query, competition, year, domain=None):
         return retrieve_rules(store=self.rule_store,
@@ -25,18 +25,19 @@ class AgentTool:
             return []
         return self.image_store.similarity_search_by_vector(query_vector, k=k)
 
-def compile_graph(llm, embedding_model, clip_embedding_model):
-    rule_store = load_rule_store(embedding_model)
-    engg_store = load_engg_store(embedding_model)
-    image_store = load_image_store(clip_embedding_model)
+def compile_graph(llm, embedding_model, clip_embedding_model,
+                  vectorstore_manager, chat_store):
 
-    tools = AgentTool(rule_store, engg_store, image_store)
+    tools = AgentTool(embedding_model=embedding_model, clip_embedding_model=clip_embedding_model, 
+                      vectorstore_manager=vectorstore_manager, 
+                      chat_store=chat_store)
     return build_gragh(llm, tools)
     
 
 def run_agent_stream(*, question: str, mode: str,
                      competition: str | None, year: int | None,
-                     chat_id: str, llm) -> Generator[Dict, None, None]:
+                     chat_id: str, llm, embedding_model, clip_embedding_model,
+                     vectorstore_manager, chat_store) -> Generator[Dict, None, None]:
     """Yields incremental agent output.
     
     Final yield MUST contain:
@@ -45,7 +46,9 @@ def run_agent_stream(*, question: str, mode: str,
 
     """
 
-    compiled_graph = compile_graph(llm)
+    compiled_graph = compile_graph(llm, embedding_model=embedding_model,
+                                   clip_embedding_model=clip_embedding_model,
+                                   vectorstore_manager=vectorstore_manager, chat_store=chat_store)
 
     # Initial state
     state = {"question": question, "mode": mode,

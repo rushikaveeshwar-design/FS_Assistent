@@ -1,0 +1,27 @@
+# This is for example purpose only later will be changed.
+rulebooks:
+  - pdf_path: data/rulebooks/FS_Germany_2024.pdf
+    competition: FS Germany
+    year: 2024
+    sections: [EV, T, CV]
+    source: FS Germany Rulebook 2024
+
+  - pdf_path: data/rulebooks/Formula_Bharat_2025.pdf
+    competition: Formula Bharat
+    year: 2025
+    sections: [EV, IC]
+    source: Formula Bharat Rulebook 2025
+
+engineering:
+  - pdf_path: data/engineering/Vehicle_Dynamics.pdf
+    domain: chassis
+    topic: vehicle_dynamics
+    source: Milliken & Milliken
+
+images:
+  - pdf_path: data/rulebooks/FS_Germany_2024.pdf
+    competition: FS Germany
+    year: 2024
+    domain: chassis
+    section: EV
+    source: FS Germany Rulebook 2024

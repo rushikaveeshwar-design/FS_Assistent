@@ -1,6 +1,6 @@
 def retrieve_rules(store, query: str, 
                    competition: str, year: int, 
-                   domain: str | None=None, k: int=5):
+                   domain: str | None=None, k: int=3):
     filters = {"competition": competition,
                "year": year}
     if domain:

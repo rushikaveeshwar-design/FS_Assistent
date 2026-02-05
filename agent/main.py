@@ -4,11 +4,17 @@ from pydantic import BaseModel
 from langgraph.graph import StateGraph
 from agent.citations import analyze_rule_docs
 from agent.models import AnalyzedRule, CitationModel, AnswerPayload
-from agent.subsystem import infer_subsystem_from_context
+from agent.subsystem import infer_subsystem_from_context, infer_subsystem
 from retrieval.image_retriever import retrieve_relevant_images, retrieving_images
+from data_ingestion.doc_utils import (load_document_registry, resolve_rulebook_documents,
+                                      resolve_engineering_documents)
+from data_ingestion.build_vectorstore import load_rule_vectorstores, load_engg_vectorstores, load_image_vectorstores
+from retrieval.rule_retriever import retrieve_rules
+from retrieval.engg_retriever import retrieve_engg
 
 class ChatState(BaseModel):
     question: str
+    mode: str
     subqueries: List[str]
     competition: Optional[str]
     year: Optional[int]
@@ -100,8 +106,32 @@ def infer_assumptions(state) -> list[str]:
     return assumptions
 
 def retrieve_rule_node(state: ChatState, tools, llm):
-    """Retrieve and analyze rules using subqueries + subsystem inference."""
+    """Retrieve and analyze rule documents.
+    This node:
+    - Resolves relevant rulebook PDFs from registry
+    - Loads/creates TEXT vectorstores
+    - Loads/creates IMAGE vectorstores from the same PDFs
+    - Attaches both the chat
+    - Retrieves rule chunks using subqueries
+    """
     queries = state.subqueries if state.subqueries else [state.question]
+
+    registry = load_document_registry()
+    descriptors = resolve_rulebook_documents(registry, competition=state.competition,
+                                             year=state.year)
+    
+    rule_stores = load_rule_vectorstores(descriptors=descriptors, 
+                                         chat_id=state.chat_id, chat_store=tools.chat_store,
+                                         vectorstore_manager=tools.vectorstore_manager)
+    
+    image_stores = load_image_vectorstores(descriptors=descriptors, chat_id=state.chat_id,
+                                           chat_store=tools.chat_store,
+                                           vectorstore_manager=tools.vectorstore_manager,
+                                           clip_model=tools.clip_model, preprocess=tools.preprocess, device=tools.device)
+    
+    # Attach stores to tools
+    tools.rule_store = rule_stores
+    tools.image_store = image_stores
 
     all_docs = []
     seen = set()
@@ -109,27 +139,59 @@ def retrieve_rule_node(state: ChatState, tools, llm):
     # Infer subsystem using full context
     domain = infer_subsystem_from_context(state.question,
                                           queries, llm)
-    for query in queries:
-        docs = tools.get_rules(query=query, competition=state.competition,
-                               year=state.year, domain=domain)
-        
-        for doc in docs:
-            key = (doc.metadata.get("section"), doc.page_content)
-            if key not in seen:
-                seen.sdd(key)
-                all_docs.append(doc)
+    for store in rule_stores:
+        for query in queries:
+            docs = retrieve_rules(store=store, query=query, competition=state.competition,
+                                   year=state.year, domain=domain)
+            
+            for doc in docs:
+                key = (doc.metadata.get("section"), doc.page_content)
+                if key not in seen:
+                    seen.add(key)
+                    all_docs.append(doc)
     
-    # Preserve existing analysis step
     state.retrieve_rules = analyze_rule_docs(all_docs)
     return state
 
-def retrieve_engg_node(state: ChatState, tools):
-    docs = tools.get_engg(state["question"])
-    state["retrieved_engg"] = docs
+def retrieve_engg_node(state: ChatState, tools, llm):
+    """Retrieve and analyze engineering documents.
+    This node:
+    - Resolves relevant engineering PDFs from registry
+    - Loads/creates TEXT vectorstores
+    - Loads/creates IMAGE vectorstores from same PDFs
+    - Attaches both to the chat
+    - Retrieves engineering chunks 
+    """
+    queries = state.subqueries if state.subqueries else [state.question]
+
+    registry = load_document_registry()
+
+    descriptors = resolve_engineering_documents(registry,
+                                                domain=state.inspection_focus or infer_subsystem_from_context(state.question, queries, llm),
+                                                topic=None)
+    
+    engg_stores = load_engg_vectorstores(descriptors=descriptors,
+                                         chat_id=state.chat_id, chat_store=tools.chat_store,
+                                         vectorstore_manager=tools.vectorstore_manager)
+    
+    image_stores = load_image_vectorstores(descriptors=descriptors, 
+                                           chat_id=state.chat_id,
+                                           vectorstore_manager=tools.vectorstore_manager,
+                                           chat_store=tools.chat_store, clip_model=tools.clip_model,
+                                           preprocess=tools.preprocess, device=tools.device)
+    
+    tools.engg_store = engg_stores
+    tools.image_store = image_stores
+    
+    docs = []
+    for store in engg_stores:
+        docs.extend(retrieve_engg(store=store, query=state.question))
+    state.retrieved_engg = docs
     return state
 
-def compare_rules_node(state, tools, llm):
-    competitions = state.competitions
+# Compare rules
+def compare_rules_node(state: ChatState, tools, llm):
+    competitions = state.competition
     queries = state.subqueries if state.subqueries else [state.question]
 
     domain = infer_subsystem_from_context(state.question,
@@ -153,6 +215,67 @@ def compare_rules_node(state, tools, llm):
 
     state.comparison = all_results
     return state
+
+def infer_diagram_relevance(*, mode: str,
+                            question: str, retrieved_rules: list,
+                            retrieved_engg: list,
+                            images: list[dict]):
+        """
+    Returns one of:
+    - "none"        : No relevant diagrams
+    - "supporting"  : Diagrams can clarify but are not decisive
+    - "critical"    : Diagrams directly affect correctness / questioning
+
+    This is a reasoning constraint, NOT a retrieval trigger.
+    """
+        if not images:
+            return "none"
+        
+        q = question.lower()
+
+        if mode == "Tech Inspection":
+            return "critical"
+
+        if mode == "Design Audit":
+            return "supporting"
+        
+        if mode == "Rule Q&A":
+            return "supporting"
+
+        # Explicit spatial reasoning
+        spatial_triggers = [
+            "layout", "placement", "clearance",
+            "mount", "orientation", "routing",
+            "figure", "diagram", "cross section"
+        ]
+        if any(k in q for k in spatial_triggers):
+            return "supporting"
+
+        # Default safe behavior
+        return "none"
+
+def build_diagram_instructions(diagram_mode: str, images: list[dict]):
+    if diagram_mode == "none":
+        return ""
+    
+    if diagram_mode == "supporting":
+        return """
+Diagram handling rules:
+- Diagrams are provided as supporting references only.
+- Do Not infer dimensions, geometry, or intent beyond what is visible.
+- If a rule or explanation depends on unseen diagram details,
+then explicitly state what is missing.
+- Never invent diagram content.
+"""
+
+    return """
+Diagram handling rules (CRITICAL):
+- Diagrams are authoritative constraints.
+- Base reasoning ONLY on what is explicitly visible.
+- If compilance or correctness cannot be verified from the diagram,
+state this clearly and request clarification.
+- Never assume scale, orientation, or hidden features.
+"""
 
 def infer_inspection_focus(*, question: str, subqueries: list[str], 
                            inspection_history: list[dict], llm):
@@ -284,10 +407,21 @@ def inspection_focus_node(state, llm):
     )
     return state
 
+# Inspection mode
 def inspector_node(state, llm, tools, clip_model, device):
-    images = retrieve_relevant_images(query=state.inspection_focus or state.question,
-                                      tools=tools, clip_model=clip_model,
-                                      device=device, k=1)
+    images = []
+    if retrieving_images(state.question):
+        images = retrieve_relevant_images(query=state.inspection_focus or state.question,
+                                        tools=tools, clip_model=clip_model,
+                                        device=device, k=1)
+        
+    diagram_mode = infer_diagram_relevance(mode="Tech Inspection", question=state.question,
+                                           retrieved_rules=state.retrieved_rules, retrieved_engg=state.retrieved_engg,
+                                           images=images)
+    
+    diagram_instructions = build_diagram_instructions(diagram_mode=diagram_mode,
+                                                      images=images)
+    
     prompt = f"""
 You are a Formula Student technical inspector.
 
@@ -299,16 +433,18 @@ Relevant rules:
 {state.retrieved_rules}
 
 Relevant diagrams:
-{images}
+{images or "None"}
 
 Previous interactions:
 {state.inspection_history}
+
+{diagram_instructions}
 
 Instructions:
 - Ask one precise and most critical, rule-backed inspection question
 based on the current discussion.
 - The question MUST reference at least one rule section.
-- If the diagram is provided frame the question around it.
+- If the diagram is provided, frame the question around it.
 - Ask the user to justify their design with respect to the diagram.
 - Increase strictness if ambiguity was observed.
 - Do not explain unless asked.
@@ -363,6 +499,7 @@ def compress_rules(rules: list[AnalyzedRule], max_rules=4):
     priority = {"must": 0, "should": 1, "may": 2, "unspecified": 3}
     return sorted(rules, key=lambda r: priority[r.confidence])[:max_rules]
 
+# Rule Q&A
 def synthesize_answer(state: ChatState, llm, tools, 
                       clip_model, device):
         
@@ -374,6 +511,13 @@ def synthesize_answer(state: ChatState, llm, tools,
         images = retrieve_relevant_images(query=state["question"],
                                         tools=tools, clip_model=clip_model,
                                         device=device, k=1)
+        
+    diagram_mode = infer_diagram_relevance(mode=state.mode, question=state.question,
+                                           retrieved_engg=state.retrieved_engg,
+                                           retrieved_rules=rules, images=images)
+    
+    diagram_instructions = build_diagram_instructions(diagram_mode=diagram_mode,
+                                                      images=images)
 
     prompt = f"""
 
@@ -386,10 +530,12 @@ Rules:
 {rules}
 
 Engineering:
-{state.retrieved_engineering}
+{state.retrieved_engg}
 
 Available diagrams:
-{images}
+{images or "None"}
+
+{diagram_instructions}
 
 Instructions:
 - Clearly distinguish rule requirements from engineering advice
@@ -439,6 +585,12 @@ Design claims:
 
 Relevant rules:
 {matched_rules}
+
+Diagram handling:
+- If diagrams are referenced in claims or rules but not provided,
+  mark the claim as AMBIGUOUS.
+- Do NOT assume geometry or layout.
+- Cite rules precisely.
 
 Return output strictly in this format:
 [
@@ -508,6 +660,7 @@ def audit_node(state: ChatState, tools, llm):
     state.audit_results = results
     return state
 
+# Design audit
 def synthesize_audit_node(state: ChatState, llm):
     structured_audit = synthesize_audit(claims=state.design_claims,
                               matched_rules=state.audit_results,
@@ -522,8 +675,8 @@ def build_gragh(llm, tools):
 
     graph.add_node("classify", classify_intent)
     graph.add_node("decompose", lambda s: decompose_query_node(s, llm))
-    graph.add_node("get_rules", lambda s: retrieve_engg_node(s, tools))
-    graph.add_node("get_engg", lambda s: retrieve_rule_node(s, tools, llm))
+    graph.add_node("get_rules", lambda s: retrieve_rule_node(s, tools, llm))
+    graph.add_node("get_engg", lambda s: retrieve_engg_node(s, tools))
     graph.add_node("answer", lambda s: synthesize_answer(s, llm))
 
     graph.add_node("extract_claims", extract_claims_node)
@@ -544,7 +697,7 @@ def build_gragh(llm, tools):
                                  "engineering": "get_engg",
                                  "hybrid": "get_rules",
                                  "design_audit": "extract_claims",
-                                 "comparison": "compare_rulebooks",
+                                 "comparison": "compare",
                                  "tech_inspection": "infer_inspection_focus"})
     
     # Standard Q&A edges

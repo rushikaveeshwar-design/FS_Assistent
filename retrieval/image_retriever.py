@@ -7,7 +7,7 @@ def retrieve_relevant_images(query: str, tools, clip_model,
     query_vector = embed_text_for_clip(query, model=clip_model,
                                        device=device)
     
-    docs = tools.get_images_by_vector(query_vector, k=k)
+    docs = tools.get_image_by_vector(query_vector, k=k)
 
     results = []
     for d in docs:
@@ -17,8 +17,7 @@ def retrieve_relevant_images(query: str, tools, clip_model,
                         "domain": metadata["domain"],
                         "competition": metadata["competition"],
                         "year": metadata["year"],
-                        "section": metadata["section"],
-                        "caption": metadata["caption"]})
+                        "section": metadata["section"]})
     return results
 
 def retrieving_images(query: str):
