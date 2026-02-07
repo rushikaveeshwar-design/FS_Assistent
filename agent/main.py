@@ -4,7 +4,8 @@ from pydantic import BaseModel
 from langgraph.graph import StateGraph
 from agent.citations import analyze_rule_docs
 from agent.models import AnalyzedRule, CitationModel, AnswerPayload
-from agent.subsystem import infer_subsystem_from_context, infer_subsystem
+from agent.tools import extract_visual_observations, build_diagram_instructions, infer_diagram_relevance
+from agent.subsystem import infer_subsystem_from_context
 from retrieval.image_retriever import retrieve_relevant_images, retrieving_images
 from data_ingestion.doc_utils import (load_document_registry, resolve_rulebook_documents,
                                       resolve_engineering_documents)
@@ -29,7 +30,8 @@ class ChatState(BaseModel):
     inspection_status: str = None
     inspection_strictness: int = 0
     inspection_focus: str = None
-    last_user_answer: Optional[str] = None
+    user_images: List
+    image_observations: List
 
 system_prompt = """
 You are a formula student engineering assistant.
@@ -216,67 +218,6 @@ def compare_rules_node(state: ChatState, tools, llm):
     state.comparison = all_results
     return state
 
-def infer_diagram_relevance(*, mode: str,
-                            question: str, retrieved_rules: list,
-                            retrieved_engg: list,
-                            images: list[dict]):
-        """
-    Returns one of:
-    - "none"        : No relevant diagrams
-    - "supporting"  : Diagrams can clarify but are not decisive
-    - "critical"    : Diagrams directly affect correctness / questioning
-
-    This is a reasoning constraint, NOT a retrieval trigger.
-    """
-        if not images:
-            return "none"
-        
-        q = question.lower()
-
-        if mode == "Tech Inspection":
-            return "critical"
-
-        if mode == "Design Audit":
-            return "supporting"
-        
-        if mode == "Rule Q&A":
-            return "supporting"
-
-        # Explicit spatial reasoning
-        spatial_triggers = [
-            "layout", "placement", "clearance",
-            "mount", "orientation", "routing",
-            "figure", "diagram", "cross section"
-        ]
-        if any(k in q for k in spatial_triggers):
-            return "supporting"
-
-        # Default safe behavior
-        return "none"
-
-def build_diagram_instructions(diagram_mode: str, images: list[dict]):
-    if diagram_mode == "none":
-        return ""
-    
-    if diagram_mode == "supporting":
-        return """
-Diagram handling rules:
-- Diagrams are provided as supporting references only.
-- Do Not infer dimensions, geometry, or intent beyond what is visible.
-- If a rule or explanation depends on unseen diagram details,
-then explicitly state what is missing.
-- Never invent diagram content.
-"""
-
-    return """
-Diagram handling rules (CRITICAL):
-- Diagrams are authoritative constraints.
-- Base reasoning ONLY on what is explicitly visible.
-- If compilance or correctness cannot be verified from the diagram,
-state this clearly and request clarification.
-- Never assume scale, orientation, or hidden features.
-"""
-
 def infer_inspection_focus(*, question: str, subqueries: list[str], 
                            inspection_history: list[dict], llm):
     """
@@ -408,7 +349,7 @@ def inspection_focus_node(state, llm):
     return state
 
 # Inspection mode
-def inspector_node(state, llm, tools, clip_model, device):
+def inspector_node(state: ChatState, llm, tools, clip_model, device):
     images = []
     if retrieving_images(state.question):
         images = retrieve_relevant_images(query=state.inspection_focus or state.question,
@@ -421,6 +362,8 @@ def inspector_node(state, llm, tools, clip_model, device):
     
     diagram_instructions = build_diagram_instructions(diagram_mode=diagram_mode,
                                                       images=images)
+    
+    visual_context = state.image_observations or []
     
     prompt = f"""
 You are a Formula Student technical inspector.
@@ -435,6 +378,9 @@ Relevant rules:
 Relevant diagrams:
 {images or "None"}
 
+User submitted visual context:
+{visual_context}
+
 Previous interactions:
 {state.inspection_history}
 
@@ -448,6 +394,9 @@ based on the current discussion.
 - Ask the user to justify their design with respect to the diagram.
 - Increase strictness if ambiguity was observed.
 - Do not explain unless asked.
+- Use user visual observations ONLY as supporting evidence
+- If user visual interpretation is uncertain, state it
+- Do not assume compliance from image alone
 """
     
     question = llm.invoke(prompt)
@@ -468,7 +417,7 @@ based on the current discussion.
     return state
 
 def inspection_evaluation_node(state: ChatState, llm):
-    last_user_answer = state.last_user_answer
+    last_user_answer = state.inspection_history[-1]["user_answer"]
 
     verdict = evaluate_inspection_response(last_user_answer,
                                            state.inspection_strictness,
@@ -518,6 +467,8 @@ def synthesize_answer(state: ChatState, llm, tools,
     
     diagram_instructions = build_diagram_instructions(diagram_mode=diagram_mode,
                                                       images=images)
+    
+    visual_context = state.image_observations or []
 
     prompt = f"""
 
@@ -532,6 +483,9 @@ Rules:
 Engineering:
 {state.retrieved_engg}
 
+User uploaded visual context:
+{visual_context}
+
 Available diagrams:
 {images or "None"}
 
@@ -543,6 +497,9 @@ Instructions:
 - Explicitly state assumptions
 - Use diagrams only as supporting reference
 - Do not invent diagram details
+- Use user visual observations ONLY as supporting evidence
+- If user visual interpretation is uncertain, state it
+- Do not assume compliance from image alone
 
 Provide a clear, grounded answer:
 """
@@ -574,7 +531,7 @@ Provide a clear, grounded answer:
     state.answer = payload
     return state, {"final_answer": payload}
 
-def synthesize_audit(claims, matched_rules, llm):
+def synthesize_audit(state: ChatState, claims, matched_rules, llm):
     prompt = f"""
 You are reviewing a Formula Student design for rule compliance.
 
@@ -585,6 +542,9 @@ Design claims:
 
 Relevant rules:
 {matched_rules}
+
+User visual context:
+{state.image_observations}
 
 Diagram handling:
 - If diagrams are referenced in claims or rules but not provided,
@@ -613,6 +573,9 @@ COMPLIANT / AMBIGUOUS / LIKELY NON-COMPLIANT
 - Cite rule sections
 - If ambiguous, state what information is missing
 - Do not add extra text outside the structure
+- Use user visual observations ONLY as supporting evidence
+- If user visual interpretation is uncertain, state it
+- Do not assume compliance from image alone
 """
     return llm.invoke(prompt)
 
@@ -668,9 +631,20 @@ def synthesize_audit_node(state: ChatState, llm):
     state.answer = {"answer": structured_audit, 
                     "assumptions": infer_assumptions(state),
                     "citations": []}
-    return state 
+    return state
 
-def build_gragh(llm, tools):
+def vision_analysis_node(state: ChatState, vision_llm):
+    """Extracts visual observations from user images."""
+
+    if not state["user_images"]:
+        state.image_observations = []
+        return state
+    
+    state.image_observations = extract_visual_observations(state.user_images, 
+                                                           vision_llm=vision_llm)
+    return state
+
+def build_gragh(llm, tools, vision_llm):
     graph = StateGraph(ChatState)
 
     graph.add_node("classify", classify_intent)
@@ -689,10 +663,14 @@ def build_gragh(llm, tools):
     graph.add_node("inspect", lambda s: inspector_node(s, llm))
     graph.add_node("inspection_evaluation", lambda s: inspection_evaluation_node(s, llm))
 
+    graph.add_node("vision_analysis", lambda s: vision_analysis_node(s, vision_llm))
+
     graph.set_entry_point("classify")
     graph.add_edge("classify", "decompose")
 
-    graph.add_conditional_edges("decompose", lambda s: s["intent"],
+    graph.add_edge("decompose", "vision_analysis")
+
+    graph.add_conditional_edges("vision_analysis", lambda s: s["intent"],
                                 {"rule": "get_rules",
                                  "engineering": "get_engg",
                                  "hybrid": "get_rules",

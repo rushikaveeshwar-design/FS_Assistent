@@ -1,15 +1,19 @@
 import sys
 import os
+import streamlit as st
+import uuid
+from PIL import Image
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-import streamlit as st
-import uuid
 from memory.chat_store import ChatStore
 from agent.tools import run_agent_stream
 from memory.chat_store import generate_chat_title
+from convo_ui.app_context import (llm, embedding_model, 
+                                  clip_embedding_model, 
+                                  vectorstore_manager)
 
 # Page config
 st.set_page_config(layout="wide",
@@ -17,6 +21,26 @@ st.set_page_config(layout="wide",
 
 # Persist store
 chat_store = ChatStore()
+
+def make_agent_runner(*, llm, embedding_model, clip_embedding_model,
+                      vectorstore_manager, chat_store):
+    def run_agent(*, question, mode, competition, year, chat_id, user_images=None):
+        return run_agent_stream(question=question, mode=mode,
+                                competition=competition, year=year,
+                                chat_id=chat_id, llm=llm,
+                                embedding_model=embedding_model,
+                                clip_embedding_model=clip_embedding_model,
+                                vectorstore_manager=vectorstore_manager,
+                                chat_store=chat_store, user_images=user_images or [])
+    return run_agent
+
+agent_runner = make_agent_runner(
+    llm=llm,
+    embedding_model=embedding_model,
+    clip_embedding_model=clip_embedding_model,
+    vectorstore_manager=vectorstore_manager,
+    chat_store=chat_store,
+)
 
 if "chat_id" not in st.session_state:
     st.session_state.chat_id = str(uuid.uuid4())
@@ -42,7 +66,6 @@ if "inspection_state" not in st.session_state:
         "inspection_strictness": 0,
         "inspection_status": None,
         "inspection_history": [],
-        "last_user_answer": None
     }
 
 if "last_inspection_question" not in st.session_state:
@@ -114,23 +137,24 @@ def stream_answer(generator):
 
     return accumulated
 
-def run_inspection_step(question, last_user_answer=None):
+def run_inspection_step(question):
     final_payload = {}
 
     def agent_stream():
-        for event in run_agent_stream(question=question,
-                                      mode="Tech Inspection",
-                                      competition=st.session_state.competition,
-                                      year=st.session_state.year,
-                                      chat_id=st.session_state.chat_id,
-                                      **st.session_state.inspection_state,
-                                      last_user_answer=last_user_answer):
+        for event in agent_runner(
+            question=question,
+            mode="Tech Inspection",
+            competition=st.session_state.competition,
+            year=st.session_state.year,
+            chat_id=st.session_state.chat_id,
+            user_images=st.session_state.user_images,
+        ):
             if "token" in event:
                 yield event["token"]
 
             if "answer" in event:
                 final_payload.update(event)
-        
+
     answer_text = stream_answer(agent_stream())
     return answer_text, final_payload
 
@@ -160,6 +184,7 @@ if st.session_state.mode == "Tech Inspection" and st.session_state.inspection_ac
             for img in st.session_state.last_inspection_images:
                 st.markdown(f"- **{img['source']}**, page {img['page']}")
 
+# User input
 user_input = st.chat_input("Describe your design" if st.session_state.mode=="Design Audit"
                            else "Ask anything within the event and engineering space")
 
@@ -185,10 +210,8 @@ if user_input:
     
         else:
             user_answer = user_input
-            st.session_state.inspection_state["last_user_answer"] = user_answer
 
-            question, payload = run_inspection_step(question=st.session_state.last_inspection_question,
-                                                    last_user_answer=user_answer)
+            question, payload = run_inspection_step(question=st.session_state.last_inspection_question)
             st.session_state.last_inspection_question = question
             st.session_state.last_inspection_images = payload.get("images", [])
             if "inspection_status" in payload:
@@ -209,7 +232,6 @@ if user_input:
                     "inspection_strictness": 0,
                     "inspection_status": None,
                     "inspection_history": [],
-                    "last_user_answer": None
                 }
                 st.session_state.last_inspection_images = []
                 st.stop()
@@ -227,17 +249,35 @@ if user_input:
         user_input,
     )
 
+    uploaded_files = st.file_uploader("Attach image file(s)",
+                                      type=["png", "jpg", "jpeg"],
+                                      accept_multiple_files=True,
+                                      label_visibility="collapsed")
+    if uploaded_files:
+        if "user_images" not in st.session_state:
+            st.session_state.user_images = []
+
+        for file in uploaded_files:
+            image = Image.open(file).convert("RGB")
+            st.session_state.user_images.append(image)
+    
+    if st.session_state.user_images:
+        with st.expander("Uploaded images"):
+            for img in st.session_state.user_images:
+                st.image(img, use_container_width=True)
+
     with st.chat_message("FS_assistant"):
 
         final_payload = {}
 
         def agent_stream():
-            for event in run_agent_stream(
+            for event in agent_runner(
                 question=user_input,
                 mode=st.session_state.mode,
                 competition=st.session_state.competition,
                 year=st.session_state.year,
                 chat_id=st.session_state.chat_id,
+                user_images=st.session_state.user_images
             ):
                 if "token" in event:
                     yield event["token"]
@@ -270,4 +310,4 @@ if user_input:
             with st.expander("Relevant diagrams and figures"):
                 for img in final_payload["images"]:
                     st.markdown(f"- **{img['source']}**, page {img['page']}"
-                                f"({img.get('caption, diagram')})")
+                                f"({img.get('diagram')})")
