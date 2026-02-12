@@ -60,19 +60,14 @@ if "subsystem" not in st.session_state:
 if "inspection_active" not in st.session_state:
     st.session_state.inspection_active = False
 
-if "inspection_state" not in st.session_state:
-    st.session_state.inspection_state = {
-        "inspection_stage": 0,
-        "inspection_strictness": 0,
-        "inspection_status": None,
-        "inspection_history": [],
-    }
-
 if "last_inspection_question" not in st.session_state:
     st.session_state.last_inspection_question = None
 
 if "last_inspection_images" not in st.session_state:
     st.session_state.last_inspection_images = []
+
+if "user_images" not in st.session_state:
+    st.session_state.user_images = []
 
 # Sidebar control panel
 st.sidebar.title("Formula Student Assistant")
@@ -160,27 +155,16 @@ def run_inspection_step(question):
 
 # Tech inspection part
 if st.session_state.mode == "Tech Inspection" and st.session_state.inspection_active:
-    stage = st.session_state.inspection_state["inspection_stage"] + 1
-    strictness = st.session_state.inspection_state["inspection_strictness"]
-
 
     with st.chat_message("FS_assistant"):
-        st.markdown(f"Tech Inspection Questions and Progress: {stage} / 5")
+        st.markdown("### Tech Inspection")
         st.markdown(st.session_state.last_inspection_question)
     
-    level_map = {0: ("Exploratory", 0.25),
-                 1: ("Clarifying", 0.5),
-                 2: ("Compliance-focused", 0.75),
-                 3: ("Scrutineering-level", 1.0)}
-    
-    label, progress = level_map.get(strictness, ("Unknown", 0.0))
-
-    st.markdown("#### Inspection Strictness")
-    st.progress(progress)
-    st.caption(f"level:**{label}**")
+    if st.session_state.last_inspection_question:
+        st.markdown(st.session_state.last_inspection_question)
 
     if st.session_state.last_inspection_images:
-        with st.expander("Reference Diagram"):
+        with st.expander("Reference Diagrams"):
             for img in st.session_state.last_inspection_images:
                 st.markdown(f"- **{img['source']}**, page {img['page']}")
 
@@ -198,49 +182,23 @@ if user_input:
         chat_store.create_chat(st.session_state.chat_id, title)
 
     if st.session_state.mode == "Tech Inspection":
+        
         if not st.session_state.inspection_active:
             st.session_state.inspection_active = True
 
-            question, payload = run_inspection_step(question=user_input)
-            st.session_state.last_inspection_question = question
-            st.session_state.last_inspection_images = payload.get("images", [])
-            st.session_state.inspection_state["inspection_history"].append({"question": question})
-
-            st.stop()
-    
-        else:
-            user_answer = user_input
-
-            question, payload = run_inspection_step(question=st.session_state.last_inspection_question)
-            st.session_state.last_inspection_question = question
-            st.session_state.last_inspection_images = payload.get("images", [])
-            if "inspection_status" in payload:
-                st.session_state.inspection_state["inspection_status"] = payload["inspection_status"]
+        question, payload = run_inspection_step(question=user_input)
+        st.session_state.last_inspection_question = question
+        st.session_state.last_inspection_images = payload.get("images", [])
             
-            status = st.session_state.inspection_state.get("inspection_status")
+        if st.session_state.get("inspection_complete"):
+            st.session_state.inspection_active = False
 
-            if status in ("PASS", "FAIL"):
-                with st.chat_message("FS_assistant"):
-                    st.markdown(f"### Inspection Result: {status}")
-                    st.markdown(payload["answer"])
-                
-                # reset inspection state
-                st.session_state.inspection_active = False
-                st.session_state.last_inspection_question = None
-                st.session_state.inspection_state = {
-                    "inspection_stage": 0,
-                    "inspection_strictness": 0,
-                    "inspection_status": None,
-                    "inspection_history": [],
-                }
-                st.session_state.last_inspection_images = []
-                st.stop()
-            
-            # continue inspection
-            st.session_state.last_inspection_question = question
-            st.session_state.inspection_state["inspection_history"].append({"question": question,
-                                                                            "user_answer": user_answer})
+            with st.chat_message("FS_assistant"):
+                st.markdown("### Inspection Summary")
+                st.markdown(payload["answer"])
             st.stop()
+        
+        st.stop()
 
     # Storing user message
     chat_store.add_message(

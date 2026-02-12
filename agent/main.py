@@ -13,6 +13,23 @@ from data_ingestion.build_vectorstore import load_rule_vectorstores, load_engg_v
 from retrieval.rule_retriever import retrieve_rules
 from retrieval.engg_retriever import retrieve_engg
 
+class FocusObject(BaseModel):
+    focus_id: str
+    origin: str
+    status: str = "UNRESOLVED"
+    question_asked: List[str] = []
+    answers_received: List[str] = []
+    referenced_rules: List[dict] = []
+    referenced_images: List[dict] = []
+    evidence_notes: List[str] = []
+
+class InspectionState(BaseModel):
+    active: bool = False
+    focus_stack: List[FocusObject] = []
+    active_focus_index: int = 0
+    interaction_history: List[dict] = []
+    global_verdict: Optional[str] = None
+
 class ChatState(BaseModel):
     question: str
     mode: str
@@ -25,13 +42,9 @@ class ChatState(BaseModel):
     answer: Optional[dict] = None
     design_claims: List[str] = []
     audit_results: Optional[List[dict]] = None
-    inspection_history: List[dict] = []
-    inspection_stage: int = 0
-    inspection_status: str = None
-    inspection_strictness: int = 0
-    inspection_focus: str = None
-    user_images: List
-    image_observations: List
+    inspection: InspectionState = InspectionState()
+    user_images: List = []
+    image_observations: List[str] = []
 
 system_prompt = """
 You are a formula student engineering assistant.
@@ -169,7 +182,7 @@ def retrieve_engg_node(state: ChatState, tools, llm):
     registry = load_document_registry()
 
     descriptors = resolve_engineering_documents(registry,
-                                                domain=state.inspection_focus or infer_subsystem_from_context(state.question, queries, llm),
+                                                domain=infer_subsystem_from_context(state.question, queries, llm),
                                                 topic=None)
     
     engg_stores = load_engg_vectorstores(descriptors=descriptors,
@@ -269,22 +282,51 @@ Return ONLY the subsystem name.
     except Exception:
         return "general(for eg: Go in detail about the type of nut and bolts used and there industry grade dimensions, etc.)"
     
+def should_shift_focus(current_focus: str, inferred_focus: str,
+                       focus_stack):
+    if inferred_focus == current_focus:
+        return False
+    
+    for fs in focus_stack:
+        if fs.focus_id == inferred_focus and fs.status == "UNRESOLVED":
+            return False
+    
+    return True
 
-def evaluate_inspection_response(answer: str, strictness: int, 
+def next_unresolved_focus_index(focus_stack):
+    for idx, fs in enumerate(focus_stack):
+        if fs.status == "UNRESOLVED":
+            return idx
+    return None
+
+def compute_global_verdict(focus_stack):
+    failed = [fs for fs in focus_stack if fs.status == "FAILED"]
+    if not failed:
+        return "PASSED"
+    
+    for f in failed:
+        if f.focus_id in {"bracking", "battery", "safety"}:
+            return "FAILED"
+    
+    return "REWORK REQUIRED"
+
+def evaluate_inspection_response(answer: str, focus_id: str, 
                                  referenced_rules: list, llm):
     """ Returns: 'pass', 'ambiguous', 'fail' """
 
     prompt = f"""You are a Formula Student Technical Inspector.
     
+    focus area: {focus_id}
+
     User response:
     {answer}
 
     Referenced rules:
     {referenced_rules}
 
-    Strictness level: {strictness}
+    Evaluate strictly based on rule compliance and engineering correctness.
 
-    Decide:
+    Decision criteria:
     - PASS: answer clearly satisfies all rule requirements.
     - AMBIGUOUS: missing values, unclear justification, assumptions.
     - FAIL: contradicts rules or gives invalid specifications.
@@ -339,20 +381,30 @@ def enrich_rule_metadata(rule_refs, rule_store, k=1):
                              "text":docs[0].page_content})
     return enriched
 
-def inspection_focus_node(state, llm):
-    state.inspection_focus = infer_inspection_focus(
-        question=state.question,
-        subqueries=state.subqueries,
-        inspection_history=state.inspection_history,
-        llm=llm,
-    )
+def infer_primary_focus_node(state: ChatState, llm):
+
+    if state.inspection.active:
+        return state
+    
+    focus = infer_inspection_focus(question=state.question,
+                                   subqueries=state.subqueries,
+                                   inspection_history=[],
+                                   llm=llm)
+    
+    state.inspection.active = True
+    state.inspection.focus_stack.append(FocusObject(focus_id=focus,
+                                                    origin="primary"))
+    state.inspection.active_focus_index = 0
     return state
 
 # Inspection mode
 def inspector_node(state: ChatState, llm, tools, clip_model, device):
+    inspection = state.inspection
+    focus = inspection.focus_stack[inspection.active_focus_index]
+
     images = []
     if retrieving_images(state.question):
-        images = retrieve_relevant_images(query=state.inspection_focus or state.question,
+        images = retrieve_relevant_images(query=focus.focus_id or state.question,
                                         tools=tools, clip_model=clip_model,
                                         device=device, k=1)
         
@@ -368,9 +420,7 @@ def inspector_node(state: ChatState, llm, tools, clip_model, device):
     prompt = f"""
 You are a Formula Student technical inspector.
 
-Inspection stage: {state.inspection_stage}
-Strictness level: {state.inspection_strictness}
-Focus area: {state.inspection_focus}
+Current focus: {focus.focus_id}
 
 Relevant rules:
 {state.retrieved_rules}
@@ -382,7 +432,7 @@ User submitted visual context:
 {visual_context}
 
 Previous interactions:
-{state.inspection_history}
+{inspection.interaction_history}
 
 {diagram_instructions}
 
@@ -391,7 +441,7 @@ Instructions:
 based on the current discussion.
 - The question MUST reference at least one rule section.
 - If the diagram is provided, frame the question around it.
-- Ask the user to justify their design with respect to the diagram.
+- Ask the user to justify their design with respect to the diagram, if diagram available.
 - Increase strictness if ambiguity was observed.
 - Do not explain unless asked.
 - Use user visual observations ONLY as supporting evidence
@@ -401,47 +451,98 @@ based on the current discussion.
     
     question = llm.invoke(prompt)
     raw = extract_rule_refs(question)
-    normalized = normalize_rule_refs(raw, state.competition, 
+    normalized_refs = normalize_rule_refs(raw, state.competition, 
                                      state.year, llm)
-    rule_refs = enrich_rule_metadata(normalized, tools.rule_store)
+    enriched_rule_refs = enrich_rule_metadata(normalized_refs, tools.rule_store)
 
-    state.inspection_history.append({"stage": state.inspection_stage,
-                                     "question": question,
-                                     "rule_refs": rule_refs})
-    state.inspection_stage += 1
+    # Persist evidence into focus
+    focus.question_asked.append(question)
+    focus.referenced_rules.extend(enriched_rule_refs)
+    focus.referenced_images.extend(images)
+
+    inspection.interaction_history.append({
+        "focus": focus.focus_id,
+        "question": question,
+        "rules": normalized_refs
+    })
 
     state.answer = {"answer": question,
                     "assumptions": [],
                     "citations": [],
                     "images": images}
+    
     return state
 
 def inspection_evaluation_node(state: ChatState, llm):
-    last_user_answer = state.inspection_history[-1]["user_answer"]
+    inspection = state.inspection
+    focus = inspection.focus_stack[inspection.active_focus_index]
 
-    verdict = evaluate_inspection_response(last_user_answer,
-                                           state.inspection_strictness,
-                                           state.inspection_history[-1].get("rule_refs", []),
-                                           llm)
-    if verdict == "fail":
-        state.inspection_status = "FAIL"
-        state.answer = {"answer": "Inspection failed due to rule non-compliance.",
-                        "inspection_status": "FAIL",
-                        "assumptions": [],
-                        "citations": []}
-        return state
+    user_answer = state.question # user response as state.question
+    focus.answers_received.append(user_answer)
+
+    verdict = evaluate_inspection_response(answer=user_answer, focus_id=focus.focus_id,
+                                           referenced_rules=focus.referenced_rules,
+                                           llm=llm)
+    inspection.interaction_history.append({"focus": focus.focus_id,
+                                           "question": focus.questions_asked[-1] if focus.question_asked else None,
+                                           "answer": user_answer,
+                                           "verdict": verdict})
 
     if verdict == "pass":
-        if state.inspection_strictness >= 3:
-            state.inspection_status = "PASS"
-            state.answer = {"answer": "Inspection passed. No blocking issues identified.",
-                            "inspection_status": "PASS",
-                            "assumptions": [],
-                            "citations": []}
-            return state
-        state.inspection_strictness += 1
+        focus.status = "PASSED"
+    elif verdict == "fail":
+        focus.status = "FAILED"
 
-    state.inspection_strictness += 1
+    # next transition decision block
+    if verdict == "ambiguous":
+        return state
+    
+    next_index = next_unresolved_focus_index(inspection.focus_stack)
+
+    if next_index < len(inspection.focus_stack):
+        inspection.active_focus_index = next_index
+        return state
+    
+    # Compute global verdict
+    inspection.global_verdict = compute_global_verdict(inspection.focus_stack)
+
+    inspection.active = False
+
+    state.answer = {"answer": f"Inspection complete. Final verdict: {inspection.global_verdict}",
+                    "inspection_complete": True,
+                    "global_verdict": inspection.global_verdict,
+                    "per_focus_results": [{"focus": fs.focus_id,
+                                           "status": fs.status}
+                                           for fs in inspection.focus_stack],
+                    "assumptions":[],
+                    "citations":[]}
+    
+    return state
+
+def inspection_focus_router_node(state: ChatState, llm):
+    inspection = state.inspection
+
+    inferred_focus = infer_inspection_focus(question=state.question, subqueries=state.subqueries,
+                                      inspection_history=inspection.interaction_history,
+                                      llm=llm)
+    
+    current_focus = inspection.focus_stack[inspection.active_focus_index].focus_id
+
+    if should_shift_focus(current_focus, inferred_focus,
+                          inspection.focus_stack):
+        inspection.focus_stack.append(FocusObject(focus_id=inferred_focus,
+                                                  origin="secondary"))
+        
+        inspection.active_focus_index = len(inspection.focus_stack) - 1
+        return state
+    
+    next_idx = next_unresolved_focus_index(inspection.focus_stack)
+
+    if next_idx is not None:
+        inspection.active_focus_index = next_idx
+        return state
+    
+    inspection.active = False
     return state
 
 def compress_rules(rules: list[AnalyzedRule], max_rules=4):
@@ -659,9 +760,10 @@ def build_gragh(llm, tools, vision_llm):
 
     graph.add_node("compare", lambda s: compare_rules_node(s, tools, llm))
 
-    graph.add_node("infer_inspection_focus", lambda s: inspection_focus_node(s, llm))
+    graph.add_node("infer_inspection_focus", lambda s: infer_primary_focus_node(s, llm))
     graph.add_node("inspect", lambda s: inspector_node(s, llm))
     graph.add_node("inspection_evaluation", lambda s: inspection_evaluation_node(s, llm))
+    graph.add_node("inspection_router", lambda s: inspection_focus_router_node(s, llm))
 
     graph.add_node("vision_analysis", lambda s: vision_analysis_node(s, vision_llm))
 
@@ -693,10 +795,14 @@ def build_gragh(llm, tools, vision_llm):
     # Inspection edge
     graph.add_edge("infer_inspection_focus", "inspect")
     graph.add_edge("inspect", "inspection_evaluation")
+    graph.add_edge("inspection_evaluation", "inspection_router")
 
+    graph.add_conditional_edges("inspection_router",
+                                lambda s: s.inspection.active,
+                                {True: "inspect",
+                                 False: "answer"})
 
     graph.set_finish_point("answer")
     graph.set_finish_point("audit_synthesis")
-    graph.set_finish_point("inspection_evaluation")
 
     return graph.compile()
