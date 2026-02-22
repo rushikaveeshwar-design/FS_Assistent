@@ -1,3 +1,6 @@
+from agent.logger import invoke_llm
+from agent.main import ChatState
+
 SUBSYSTEM_KEYWORDS = {
     "accumulator": "powertrain",
     "roll hoop": "chassis",
@@ -13,8 +16,8 @@ def infer_subsystem(query: str) -> str | None:
             return value
     return None
 
-def infer_subsystem_from_context(question:str, subqueries: list[str],
-                                 llm):
+def infer_subsystem_from_context(state: ChatState, question:str, subqueries: list[str],
+                                 llm, memory=None):
     """Infer primary subsystem(s) involved using semantic reasoning."""
 
     prompt = f"""
@@ -26,6 +29,9 @@ Main question:
 
 Subquestions:
 {subqueries}
+
+Known project memory:
+{memory}
 
 Task:
 Infer the most relevant vehicle subsystem involved.
@@ -47,7 +53,8 @@ Return ONLY the subsystem name.
 
 """
     try:
-        subsystem = llm.invoke(prompt).strip().lower()
+        subsystem = invoke_llm(llm, prompt, chat_id=state.chat_id,
+                               node="infer_subsystem_from_context")
         return subsystem
     except Exception:
         return infer_subsystem(question)

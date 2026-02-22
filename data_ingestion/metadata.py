@@ -25,4 +25,3 @@ class ImageMetadata:
     section: Optional[str]
     caption: Optional[str] = None
     
-    

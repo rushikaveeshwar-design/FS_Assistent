@@ -1,4 +1,5 @@
 import os
+import time
 from datetime import datetime, timezone
 from retrieval.vectorstore import VectorStoreManager
 from data_ingestion.clip_embedder import embed_images
@@ -7,6 +8,7 @@ from retrieval.vectorstore import (RULE_STORE_PATH, ENGG_STORE_PATH,
 from data_ingestion.doc_utils import compute_pdf_sha256
 from data_ingestion.pdf_loader import ingest_rulebook_pdf, ingest_engg_pdf
 from data_ingestion.pdf_image_extractor import extract_images_from_pdf
+from agent.logger import log_event, log_exception
 
 def build_rule_store(chunks, metadatas, embedding_model):
     os.makedirs(RULE_STORE_PATH, exist_ok=True)
@@ -37,26 +39,6 @@ def build_image_store(images, metadatas,
                                              metadatas=metadatas)
     manager.save_store(store, IMAGE_STORE_PATH)
 
-def get_or_create_chat_vectorstore(*, chat_id: str,
-                                   document_id: str,
-                                   ingest_fn, load_fn,
-                                   save_fn, base_path: str):
-    """Ensure vectorstore for (chat_id, document_id) exists.
-    Ingest only once per conversation.
-    """
-    chat_path = os.path.join(base_path, chat_id)
-    os.makedirs(chat_id, exist_ok=True)
-
-    store_path = os.path.join(chat_path, document_id)
-
-    if os.path.exists(store_path):
-        return load_fn(store_path)
-    
-    texts, metadatas = ingest_fn()
-    store = VectorStoreManager(...).create_store(texts, metadatas)
-    save_fn(store, store_path)
-    return store
-
 def get_or_create_global_vectorstore(*, document_id: str,
                                      doc_type: str, ingest_fn,
                                      vectorstore_manager, base_path: str,
@@ -67,23 +49,49 @@ def get_or_create_global_vectorstore(*, document_id: str,
     store_path = os.path.join(base_path, document_id)
 
     if os.path.exists(store_path):
+        log_event("INFO", "vectorstore_cache_hit",
+                  chat_id=chat_id, meta={"doc_type": doc_type,
+                                         "document_id": document_id,
+                                         "path":store_path})
         chat_store.attach_document_to_chat(chat_id, document_id)
         return vectorstore_manager.load_store(store_path)
     
-    texts, metadatas = ingest_fn()
-    store = vectorstore_manager.create_store(texts, metadatas)
-    vectorstore_manager.save_store(store, store_path)
+    # cache miss (ingest)
+    try:
+        t0 = time.time()
 
-    # Register document globally
-    chat_store.conn.execute("""INSERT OR IGNORE INTO documents
-                 (document_id, doc_type, vectorstore_path, create_at)
-                 VALUES (?, ?, ?, ?)""", (document_id, doc_type,
-                                          store_path, datetime.now(timezone.utc).isoformat()))
+        log_event("INFO", "vectorstore_cache_miss",
+                  chat_id=chat_id, meta={"doc_type": doc_type,
+                                         "document_id": document_id})
+
+        texts, metadatas = ingest_fn()
+
+        t_ingest = int((time.time() - t0)*1000)
+
+        store = vectorstore_manager.create_store(texts, metadatas)
+        vectorstore_manager.save_store(store, store_path)
+
+        # Register document globally
+        chat_store.conn.execute("""INSERT OR IGNORE INTO documents
+                    (document_id, doc_type, vectorstore_path, created_at)
+                    VALUES (?, ?, ?, ?)""", (document_id, doc_type,
+                                            store_path, datetime.now(timezone.utc).isoformat()))
+        
+        chat_store.conn.commit()
+        chat_store.attach_document_to_chat(chat_id, document_id)
+
+        log_event("INFO", "vectorstore_ingest_complete",
+                chat_id=chat_id, meta={"doc_type":doc_type,
+                                        "document_id": document_id,
+                                        "chunks": len(texts),
+                                        "latency": t_ingest,
+                                        "path": store_path})
+
+        return store
     
-    chat_store.conn.commit()
-    chat_store.attach_document_to_chat(chat_id, document_id)
-
-    return store
+    except Exception as e:
+        log_exception(e, chat_id=chat_id, node="vectorstore_ingest")
+        raise
 
 def load_rule_vectorstores(descriptors, chat_id, 
                            chat_store, vectorstore_manager):

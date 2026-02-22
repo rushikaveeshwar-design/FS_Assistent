@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 
 class ChatStore:
     def __init__(self, db_path="chats.db"):
@@ -17,10 +17,15 @@ class ChatStore:
                             id INTEGER PRIMARY KEY AUTOINCREMENT,
                             chat_id TEXT, role TEXT,
                             content TEXT, timestamp TEXT)""")
+        
+        self.conn.execute("""CREATE TABLE IF NOT EXISTS chat_memory(
+                          chat_id TEXT PRIMARY KEY,
+                          memory TEXT,
+                          updated_at TEXT)""")
             
     def add_messages(self, chat_id, role, content):
         self.conn.execute("INSERT INTO messages VALUES (NULL, ?, ?, ?, ?)",
-                          (chat_id, role, content, datetime.now(datetime.timezone.utc).isoformat()))
+                          (chat_id, role, content, datetime.now(timezone.utc).isoformat()))
         
         self.conn.commit()
     
@@ -33,7 +38,7 @@ class ChatStore:
         return [{"role":role, "content":content} for role, content in cursor.fetchall()]
     
     def create_chat(self, chat_id, title):
-        now = datetime.now(datetime.timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         self.conn.execute("""INSERT OR IGNORE INTO chats
                           (chat_id, title, created_at, last_active)
                           VALUES (?, ?, ?, ?)""",
@@ -50,7 +55,7 @@ class ChatStore:
         self.conn.execute("""UPDATE chats
                           SET last_active = ?
                           WHERE chat_id = ?""",
-                          (datetime.now(datetime.timezone.utc).isoformat(), chat_id))
+                          (datetime.now(timezone.utc).isoformat(), chat_id))
         self.conn.commit()
     
     def search_messages(self, chat_id, query: str):
@@ -72,15 +77,30 @@ class ChatStore:
         self.conn.commit()
     
     def attach_document_to_chat(self, chat_id: str, document_id: str, conn):
-        conn.execute("""
+        self.conn.execute("""
                     INSERT OR IGNORE INTO chat_documents (chat_id, document_id)
                     VALUES (?, ?)""", (chat_id, document_id))
-        conn.commit()
+        self.conn.commit()
 
     def document_exists(self, document_id: str):
         cursor = self.conn.execute("SELECT 1 FROM documents WHERE document_id = ?",
                                    (document_id,))
         return cursor.fetchone() is not None
+    
+    def get_memory(self, chat_id):
+        cur = self.conn.execute("SELECT memory FROM chat_memory WHERE chat_id=?",
+        (chat_id,))
+        row = cur.fetchone()
+        return row[0] if row else ""
+    
+    def update_memory(self, chat_id, summary):
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute("""INSERT INTO chat_memory(chat_id, memory, updated_at)
+                          VALUES (?,?,?)
+                          ON CONFLICT(chat_id)
+                          DO UPDATE SET memory=excluded.memory,
+                          updated_at=excluded.updated_at""", (chat_id, summary, now))
+        self.conn.commit()
 
 def generate_chat_title(question: str, mode: str):
     return f"{mode}: {question[:40]}"

@@ -1,5 +1,5 @@
 from langchain_community.vectorstores import FAISS
-from langchain.embeddings import Embeddings
+from convo_ui.app_context import embedding_model
 from typing_extensions import List
 
 RULE_STORE_PATH = "vectorstores/rules_text"
@@ -7,7 +7,7 @@ ENGG_STORE_PATH = "vectorstores/engg_text"
 IMAGE_STORE_PATH = "vectorstores/images"
 
 class VectorStoreManager:
-    def __init__(self, embedding_model: Embeddings):
+    def __init__(self, embedding_model=embedding_model):
         self.embedding_model = embedding_model
     
     def create_store(self, texts: List[str], 
@@ -29,14 +29,14 @@ class VectorStoreManager:
         store.save_local(path)
     
 
-def load_rule_store(embedding_model: Embeddings):
+def load_rule_store(embedding_model= embedding_model):
     manager = VectorStoreManager(embedding_model)
     return manager.load_store(RULE_STORE_PATH)
 
-def load_engg_store(embedding_model: Embeddings):
+def load_engg_store(embedding_model= embedding_model):
     manager = VectorStoreManager(embedding_model)
     return manager.load_store(ENGG_STORE_PATH)
 
-def load_image_store(embedding_model: Embeddings):
+def load_image_store(embedding_model= embedding_model):
     manager = VectorStoreManager(embedding_model)
     return manager.load_store(IMAGE_STORE_PATH)

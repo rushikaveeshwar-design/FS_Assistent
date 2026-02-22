@@ -39,7 +39,7 @@ class ImageReference(BaseModel):
 
 class AnswerPayload(BaseModel):
     answer: str
-    citation: List[CitationModel]
+    citations: List[CitationModel]
     assumptions: List[str]=Field(default_factory=list)
     images: List[dict[ImageReference, Any]]
 

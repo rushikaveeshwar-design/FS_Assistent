@@ -1,42 +1,56 @@
 from retrieval.rule_retriever import retrieve_rules
 from retrieval.engg_retriever import retrieve_engg
 from typing import Generator, Dict, Literal, List, Any
-from agent.main import build_gragh
+from agent.main import build_graph, ChatState
+from agent.logger import log_event, log_exception
+from memory.user_memory_engine import UserMemoryEngine
+import time
 
 class AgentTool:
-    def __init__(self, rule_store, engg_store, image_store,
-                 vectorstore_manager, chat_store):
+    def __init__(self, rule_store=None, engg_store=None, image_store=None,
+                 vectorstore_manager=None, chat_store=None):
         self.rule_store = rule_store
         self.engg_store = engg_store
         self.image_store = image_store
         self.vectorstore_manager = vectorstore_manager
         self.chat_store = chat_store
+        self.memory_engine = UserMemoryEngine(chat_store)
 
     def get_rules(self, query, competition, year, domain=None):
-        return retrieve_rules(store=self.rule_store,
-                              query=query, competition=competition,
-                              year=year, domain=domain)
+        results = []
+        for store in self.rule_store:
+            results.extend(retrieve_rules(store=store, query=query,
+                                          competition=competition, year=year,
+                                          domain=domain))
+        return results
     
     def get_engg(self, query):
-        return retrieve_engg(store=self.engg_store, query=query)
+        results = []
+        for store in self.engg_store:
+            results.extend(retrieve_engg(store=self.engg_store, query=query))
+        return results
     
     def get_image_by_vector(self, query_vector, k=1):
         if not self.image_store:
             return []
-        return self.image_store.similarity_search_by_vector(query_vector, k=k)
+        results = []
+        for store in self.image_store:
+            results.extend(store.similarity_search_by_vector(query_vector, k=k))
 
-def compile_graph(llm, embedding_model, clip_embedding_model,
-                  vectorstore_manager, chat_store):
-
-    tools = AgentTool(embedding_model=embedding_model, clip_embedding_model=clip_embedding_model, 
-                      vectorstore_manager=vectorstore_manager, 
-                      chat_store=chat_store)
-    return build_gragh(llm, tools)
+def compile_graph(llm, vectorstore_manager, chat_store, clip_embedding_model):
     
+    log_event("INFO", "compile_graph_start")
 
+    tools = AgentTool(vectorstore_manager=vectorstore_manager, 
+                      chat_store=chat_store)
+    graph = build_graph(llm, tools, clip_model=clip_embedding_model)
+
+    log_event("INFO", "compile_graph_done")
+    return graph, tools
+    
 def run_agent_stream(*, question: str, mode: str,
                      competition: str | None, year: int | None,
-                     chat_id: str, llm, embedding_model, clip_embedding_model,
+                     chat_id: str, llm, clip_embedding_model,
                      vectorstore_manager, chat_store, user_images) -> Generator[Dict, None, None]:
     """Yields incremental agent output.
     
@@ -45,35 +59,65 @@ def run_agent_stream(*, question: str, mode: str,
     "citations": list[dict], "images": list[dict] | None}
 
     """
+    log_event("INFO", "agent_run_start", chat_id=chat_id,
+              meta={"mode": mode, "competition": competition, "year": year})
+    
+    t0_total = time.time()
+    
+    try:
 
-    compiled_graph = compile_graph(llm, embedding_model=embedding_model,
-                                   clip_embedding_model=clip_embedding_model,
-                                   vectorstore_manager=vectorstore_manager, chat_store=chat_store)
+        compiled_graph, tools = compile_graph(llm, vectorstore_manager=vectorstore_manager, 
+                                              chat_store=chat_store, clip_embedding_model=clip_embedding_model)
+        
+        memory_engine = tools.memory_engine
 
-    # Initial state
-    state = {"question": question, "mode": mode,
-             "competition": competition, "year": year,
-             "chat_id": chat_id, "user_images": user_images or [],
-             "image_observations": []}
+        # Initial state
+        state = ChatState(question=question, mode=mode, subqueries=[],
+                          competition=competition, year=year,
+                          retrieved_rules=[], retrieved_engg=[],
+                          intent=None, user_images=user_images or [],
+                          image_observations=[])
+        state.chat_id = chat_id
 
-    # streaming
-    for update in compiled_graph.stream(state):
-        # Only have to stream answer tokens
-        if "answer_token" in update:
-            yield {"token": update["answer_token"]}
+        # streaming
+        for update in compiled_graph.stream(state):
+            # Only have to stream answer tokens
+            if "answer_token" in update:
+                yield {"token": update["answer_token"]}
 
-        if "final_answer" in update:
-            final_payload = update["final_answer"]
+            if "final_answer" in update:
+                log_event("INFO", "agent_run_complete", chat_id=chat_id)
 
-            if "images" not in final_payload:
-                final_payload["images"] = []
+                total_latency = int((time.time() - t0_total)*1000)
 
-            yield final_payload
+                log_event("INFO", "agent_run_complete",
+                          chat_id=chat_id, meta={"mode": mode,
+                                                 "latency": total_latency})
+
+                final_payload = update["final_answer"]                
+
+                if "images" not in final_payload:
+                    final_payload["images"] = []
+                
+                memory_engine.update(chat_id, llm, new_info=f"""
+                                    User question: {question}
+                                    Assistent answer: {final_payload["answer"]}""")
+
+                yield final_payload
+    
+    except Exception as e:
+        total_latency = int((time.time() - t0_total)*1000)
+
+        log_event("ERROR", "agent_run_failed", chat_id=chat_id,
+                  meta={"mode": mode, "latency": total_latency})
+
+        log_exception(e, chat_id=chat_id, node="run_agent_stream")
+        raise
 
 DiagramMode = Literal["none", "doc_reference", 
                       "user_refernce", "comparitative"]
 
-def extract_visual_observations(*, user_images: List[Any], 
+def extract_visual_observations(*, state: ChatState, user_images: List[Any], 
                                 vision_llm) -> List[Dict[str, str]]:
     """
     Convert uploaded images into structured, uncertainty-aware observations.
@@ -105,10 +149,22 @@ by answering the question.
 }}
 """
         try:
+            t0 = time.time()
+
             result = vision_llm.invoke(prompt, image=image)
+
+            latency = int((time.time() - t0)*1000)
+
+            log_event("DEBUG", "vision_llm_invoke", chat_id=state.chat_id,
+                      meta={"image_index": idx,
+                            "latency": latency})
+
             observations.append(result)
             
         except Exception as e:
+            log_exception(e, chat_id=state.chat_id, 
+                          node="extract_visual_observations")
+
             observations.append({
                 "image_index": idx,
                 "observations": "Unable to analyze image",

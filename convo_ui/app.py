@@ -3,6 +3,7 @@ import os
 import streamlit as st
 import uuid
 from PIL import Image
+import json
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
@@ -11,9 +12,12 @@ if PROJECT_ROOT not in sys.path:
 from memory.chat_store import ChatStore
 from agent.tools import run_agent_stream
 from memory.chat_store import generate_chat_title
-from convo_ui.app_context import (llm, embedding_model, 
-                                  clip_embedding_model, 
+from convo_ui.app_context import (llm, clip_embedding_model, 
                                   vectorstore_manager)
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import inch
+import io
 
 # Page config
 st.set_page_config(layout="wide",
@@ -22,13 +26,12 @@ st.set_page_config(layout="wide",
 # Persist store
 chat_store = ChatStore()
 
-def make_agent_runner(*, llm, embedding_model, clip_embedding_model,
+def make_agent_runner(*, llm, clip_embedding_model,
                       vectorstore_manager, chat_store):
     def run_agent(*, question, mode, competition, year, chat_id, user_images=None):
         return run_agent_stream(question=question, mode=mode,
                                 competition=competition, year=year,
                                 chat_id=chat_id, llm=llm,
-                                embedding_model=embedding_model,
                                 clip_embedding_model=clip_embedding_model,
                                 vectorstore_manager=vectorstore_manager,
                                 chat_store=chat_store, user_images=user_images or [])
@@ -36,7 +39,6 @@ def make_agent_runner(*, llm, embedding_model, clip_embedding_model,
 
 agent_runner = make_agent_runner(
     llm=llm,
-    embedding_model=embedding_model,
     clip_embedding_model=clip_embedding_model,
     vectorstore_manager=vectorstore_manager,
     chat_store=chat_store,
@@ -69,10 +71,15 @@ if "last_inspection_images" not in st.session_state:
 if "user_images" not in st.session_state:
     st.session_state.user_images = []
 
+if "last_inspection_report" not in st.session_state:
+    st.session_state.last_inspection_report = None
+
 # Sidebar control panel
 st.sidebar.title("Formula Student Assistant")
 if st.sidebar.button("New Chat"):
     st.session_state.chat_id = str(uuid.uuid4())
+    st.session_state.last_inspection_report = None
+    st.session_state.user_images = []
 
 st.sidebar.markdown("### Your chats")
 
@@ -127,10 +134,34 @@ def stream_answer(generator):
     accumulated = ""
 
     for token in generator:
-        accumulated += token
-        placeholder.markdown(accumulated)
+        if isinstance(token, str):
+            accumulated += token
+            placeholder.markdown(accumulated)
 
     return accumulated
+
+def generate_inspection_pdf(report):
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer)
+    elements = []
+    styles = getSampleStyleSheet()
+
+    elements.append(Paragraph("Inspection Report", styles["Heading1"]))
+    elements.append(Spacer(1, 0.3*inch))
+
+    elements.append(Paragraph(f"Global Verdict: {report['global_verdict']}",
+                    styles["Heading2"]))
+    
+    elements.append(Spacer(1, 0.3*inch))
+
+    for focus in report["per_focus"]:
+        elements.append(Paragraph(f"{focus['focus_id']} - {focus['status']}",
+                                  styles["Heading3"]))
+        elements.append(Spacer(1, 0.1*inch))
+
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer
 
 def run_inspection_step(question):
     final_payload = {}
@@ -187,15 +218,51 @@ if user_input:
             st.session_state.inspection_active = True
 
         question, payload = run_inspection_step(question=user_input)
+        chat_store.add_messages(st.session_state.chat_id, "FS_assistant", question)
         st.session_state.last_inspection_question = question
         st.session_state.last_inspection_images = payload.get("images", [])
             
-        if st.session_state.get("inspection_complete"):
-            st.session_state.inspection_active = False
+        if payload.get("inspection_complete"):
+            report = payload.get("report")
+            st.session_state.last_inspection_report = report
 
             with st.chat_message("FS_assistant"):
-                st.markdown("### Inspection Summary")
-                st.markdown(payload["answer"])
+                st.markdown("## Inspection Complete")
+                st.markdown(f"### Final verdict: **{report['global_verdict']}**")
+
+                st.markdown("### Per-Focus Results")
+
+                for focus in report["per_focus"]:
+                    with st.expander(f"{focus['focus_id']} - {focus['status']}"):
+                        st.markdown(f"**Origin:** {focus['origin']}")
+                        st.markdown(f"**Confidence:** {focus['confidence_explanation']}")
+
+                        if focus["referenced_rules"]:
+                            st.markdown("**Referenced Rules:**")
+                            for rule in focus["referenced_rules"]:
+                                st.markdown(f"- {rule}")
+                        
+                        if focus["referenced_images"]:
+                            st.markdown("**Referenced Diagrams:**")
+                            for img in focus["referenced_images"]:
+                                st.markdown(f"- {img['source']} page {img['page']}")
+                
+                json_data = json.dumps(report, indent=2)
+
+                st.download_button(label="Download JSON",
+                                   data=json_data,
+                                   file_name="inspection_report.json",
+                                   mime="application/json")
+                
+                pdf_file = generate_inspection_pdf(report)
+
+                st.download_button(label="Download PDF",
+                                   data=pdf_file,
+                                   file_name="inspection_report.pdf",
+                                   mime="application/pdf")
+            
+            st.session_state.inspection_active = False
+            st.session_state.user_images = []
             st.stop()
         
         st.stop()
